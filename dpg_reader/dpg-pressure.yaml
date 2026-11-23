@@ -17,6 +17,8 @@ esphome:
   name: pressure-gauge-bridge
   friendly_name: Pressure Gauge Bridge
   min_version: 2026.11.0
+  includes:
+    - pressure_statistics.h
 
 esp32:
   board: esp32dev
@@ -104,6 +106,32 @@ number:
     optimistic: true
     restore_value: true
 
+# Completed-window statistics have their own period, independent of live reports.
+select:
+  - platform: template
+    id: pressure_statistics_period
+    name: "Pressure statistics period"
+    icon: mdi:timer-outline
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: "1 minute"
+    options:
+      - "1 minute"
+      - "5 minutes"
+      - "10 minutes"
+      - "15 minutes"
+      - "30 minutes"
+      - "60 minutes"
+    on_value:
+      - lambda: |-
+          const uint32_t periods_ms[] = {
+            60000U, 300000U, 600000U, 900000U, 1800000U, 3600000U
+          };
+          // Restored at boot as well as when changed. Discard partial windows;
+          // the previous completed results remain until a new full window ends.
+          dpg_statistics::statistics.set_period(millis(), periods_ms[i]);
+
 # Poll unit metadata only while connected; avoid warnings while the gauge is off.
 interval:
   - interval: 5s
@@ -113,6 +141,15 @@ interval:
             lambda: return id(gauge_connected);
           then:
             - component.update: dpg_unit
+  # Publish on schedule even if the gauge is disconnected or stops notifying.
+  - interval: 1s
+    then:
+      - lambda: |-
+          dpg_statistics::statistics.advance(millis(), [](const dpg_statistics::PressureSummary &result) {
+            id(minimum_pressure).publish_state(result.minimum);
+            id(maximum_pressure).publish_state(result.maximum);
+            id(average_pressure).publish_state(result.average);
+          });
 
 sensor:
   - platform: ble_client
@@ -183,6 +220,12 @@ sensor:
           return NAN;
       }
     on_value:
+      - lambda: |-
+          dpg_statistics::statistics.sample(millis(), x, [](const dpg_statistics::PressureSummary &result) {
+            id(minimum_pressure).publish_state(result.minimum);
+            id(maximum_pressure).publish_state(result.maximum);
+            id(average_pressure).publish_state(result.average);
+          });
       - if:
           condition:
             lambda: return std::isfinite(x);
@@ -234,6 +277,39 @@ sensor:
             return x;
           }
           return {};
+
+  - platform: template
+    id: minimum_pressure
+    name: "Minimum pressure"
+    device_class: pressure
+    state_class: measurement
+    unit_of_measurement: "psi"
+    accuracy_decimals: 2
+    # Emit each completed window, including when its value is unchanged.
+    force_update: true
+    update_interval: never
+
+  - platform: template
+    id: maximum_pressure
+    name: "Maximum pressure"
+    device_class: pressure
+    state_class: measurement
+    unit_of_measurement: "psi"
+    accuracy_decimals: 2
+    # Emit each completed window, including when its value is unchanged.
+    force_update: true
+    update_interval: never
+
+  - platform: template
+    id: average_pressure
+    name: "Average pressure"
+    device_class: pressure
+    state_class: measurement
+    unit_of_measurement: "psi"
+    accuracy_decimals: 2
+    # Emit each completed window, including when its value is unchanged.
+    force_update: true
+    update_interval: never
 
 # Write-only SPI avoids GPIO12, a boot strapping pin on the original CYD.
 # No touchscreen is needed to view this interface.

@@ -22,9 +22,9 @@ If the screen is blank or colors are wrong, first check the actual board against
 
 ## Install
 
-Use ESPHome **2026.11.0 or newer**. Configuration validation and a full ESP32 firmware build passed with 2026.11.0 using dummy Wi-Fi secrets. The firmware fits in its OTA application partition. Seventeen synthetic-packet assertions passed against the actual C++ parsing lambdas, including signed readings, mbar conversion, invalid metadata, and unit changes. The user has confirmed basic pressure streaming and display operation; the new reporting-interval control still needs an on-device check.
+Use ESPHome **2026.11.0 or newer**. Configuration validation and a full ESP32 firmware build passed with 2026.11.0 using dummy Wi-Fi secrets. The firmware fits in its OTA application partition. Seventeen synthetic-packet assertions passed against the actual C++ parsing lambdas, including signed readings, mbar conversion, invalid metadata, and unit changes. The user has confirmed basic pressure streaming and display operation; the new statistics sensors still need an on-device check.
 
-1. Copy `dpg-pressure.yaml` into your ESPHome configuration directory (or create a device there and replace its YAML). If the file is in a subdirectory, place `secrets.yaml` alongside it or in an ancestor ESPHome configuration directory.
+1. Copy **both `dpg-pressure.yaml` and `pressure_statistics.h`** into the same ESPHome configuration directory (or create a device there and replace its YAML, then copy the header alongside it). The local header is required for compilation. If the file is in a subdirectory, place `secrets.yaml` alongside it or in an ancestor ESPHome configuration directory.
 2. Supply `wifi_ssid` and `wifi_password` in `secrets.yaml`. A `secrets.yaml.example` is included; use a 2.4 GHz Wi-Fi network. Verify `gauge_mac` matches your gauge.
 3. Set the gauge to **psi** initially. Close SECA/nRF Connect and disconnect other BLE clients so the ESP32 can connect. Keep the gauge awake and nearby.
 4. Validate and install through ESPHome Device Builder, using USB for the first installation. Subsequent installations can use OTA. If using the CLI, run the following from this directory with ESPHome installed:
@@ -35,7 +35,7 @@ Use ESPHome **2026.11.0 or newer**. Configuration validation and a full ESP32 fi
    esphome run dpg-pressure.yaml
    ```
 
-5. In Home Assistant, accept the discovered device under **Settings > Devices & services > ESPHome**, or add the ESPHome integration using the ESP32's IP address. It exposes `Pressure`, `Gauge connected`, `Gauge unit code` (diagnostic), `Display backlight`, and `Pressure reporting interval` (configuration).
+5. In Home Assistant, accept the discovered device under **Settings > Devices & services > ESPHome**, or add the ESPHome integration using the ESP32's IP address. It exposes `Pressure`, `Gauge connected`, `Gauge unit code` (diagnostic), `Display backlight`, `Pressure reporting interval` (configuration), `Minimum pressure`, `Maximum pressure`, `Average pressure`, and `Pressure statistics period` (configuration).
 6. Confirm the screen and Home Assistant agree with several readings on the gauge, including zero. Power the gauge off: pressure should clear to `--.--` locally and become unknown in Home Assistant. Power it back on and check that the stream resumes.
 
 ## Home Assistant reporting interval
@@ -47,6 +47,33 @@ This sets the minimum spacing between valid pressure readings forwarded to Home 
 The LVGL display continues to receive every gauge update. Disconnects, invalid data, and the existing 30-second stale-stream timeout clear Home Assistant's pressure immediately, even with a long reporting interval. The first valid reading after startup or recovery is also forwarded immediately. The public sensor is still named `Pressure` to retain its Home Assistant identity. The updated configuration passed ESPHome 2026.11.0 validation and full compilation, plus 18 synthetic timing assertions against the actual reporting filter (including runtime interval changes, failure/recovery, and timer rollover).
 
 This control changes ESP32-to-Home-Assistant reporting only. It does not change the gauge's own measurement/BLE notification rate or write to `df471525`; the draft records that characteristic's read layout, but its write format has not been verified.
+
+## Completed-window pressure statistics
+
+The **Pressure statistics period** selector in Home Assistant offers exactly **1 minute, 5 minutes, 10 minutes, 15 minutes, 30 minutes, and 60 minutes**. It defaults to 1 minute and saves the choice across reboots. This is independent of the existing live **Pressure reporting interval** control.
+
+Three sensors publish together once each selected period has elapsed:
+
+| Sensor | Value for the immediately preceding completed window |
+| --- | --- |
+| Minimum pressure | Lowest valid pressure reading |
+| Maximum pressure | Highest valid pressure reading |
+| Average pressure | Arithmetic mean of all valid pressure readings |
+
+All values are in psi and use every valid gauge notification before the Home Assistant reporting throttle. Windows are consecutive and non-overlapping. For example, with 5 minutes selected, the first report summarizes minutes 0-5, the next minutes 5-10, and so on. A sample arriving exactly at a boundary belongs to the next window. A one-second housekeeping timer closes windows even without incoming BLE data; actual publication can be up to about one second after a boundary due to scheduling, without moving the window boundaries.
+
+The first window starts when the saved selection is restored during boot. Changing the selection discards the in-progress partial window and starts a full window of the new length immediately. These are elapsed-time windows, not wall-clock-aligned intervals. Published results remain visible until the next completed window; after a reboot, the sensors remain unknown until the first window completes. In-progress statistics are not persisted.
+
+NaN, infinite values, disconnect events, and stale-stream signals do not count as readings. A window with no valid samples reports unknown for all three sensors. A window containing a data gap summarizes only its valid samples: no values are filled into the gap. The average is a sample mean, not a time-weighted average. Each completed window is reported even if its results equal those of the preceding window (`force_update: true`).
+
+The local `pressure_statistics.h` helper keeps only a sample count, running sum, minimum, and maximum; it does not store a history of readings. ESPHome 2026.11.0 configuration validation and a full ESP32 firmware build passed for these statistics sensors. The focused C++ tests passed for all six periods, precise and delayed boundaries, empty windows, invalid readings, period changes, re-applying the same period, timer rollover, and full-rate averaging. To run them from this directory using a C++ compiler:
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Werror tests/test_pressure_statistics.cpp -o /tmp/test_pressure_statistics
+/tmp/test_pressure_statistics
+```
+
+For an on-device check, select 1 minute, observe several known readings, and confirm that the three sensors publish after the minute completes. Disconnect the gauge for a whole following window and confirm that all three become unknown at its end. Change the selection and confirm that the next report waits for a full new period.
 
 ## Pressure protocol and behavior
 
@@ -78,3 +105,5 @@ The extra measurement fields at bytes 10-13 and 16-19 remain unused because thei
 
 - [ESPHome template number controls](https://esphome.io/components/number/template/)
 - [ESPHome copy sensor](https://esphome.io/components/copy/)
+- [ESPHome template select controls](https://esphome.io/components/select/template/)
+- [ESPHome template sensor](https://esphome.io/components/sensor/template/)
