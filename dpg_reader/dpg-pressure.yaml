@@ -1,53 +1,103 @@
-# ESPHome config: "DPG" Bluetooth pressure gauge (SECA app) -> Home Assistant
-# Draft, untested. Protocol decoded from nRF Connect reads on 2026-11-22.
-#
-# Protocol notes (all little-endian):
-#   Service      df471523-9da9-47cb-abf2-44ba6959979b
-#   Meas data    df471524-...  (notify)  int32 @ bytes 2-5 = current reading (scaled)
-#                                        int32 @ bytes 10-13 = 60 psi in current unit (range or alarm?)
-#                                        int32 @ bytes 16-19 = same as current (min? TBD)
-#   Unit         df47152b-...  (notify)  byte 1 = unit code (1 = psi, 6 = mbar, others TBD)
-#                                        byte 2 = decimal places
-#   Meas rate    df471525-...            uint32 x3 = current / min / max interval in ms (1000/100/10000)
+# ESPHome: DPG Bluetooth pressure gauge (SECA app) -> Home Assistant + CYD.
+# Protocol decoded from nRF Connect reads on 2026-11-22; hardware validation needed.
+# All multibyte fields below are little-endian:
+#   df471524: int32 at bytes 2-5 = current pressure, scaled by decimal places.
+#             Bytes 10-13 and 16-19 have unknown semantics; intentionally unused.
+#   df47152b: byte 1 = unit (1: psi, 6: mbar); byte 2 = decimal places.
+#   df471525: uint32 x3 = current/min/max interval (observed 1000/100/10000 ms).
 
 substitutions:
   gauge_mac: "D3:31:E8:2F:CC:51"
   svc: "df471523-9da9-47cb-abf2-44ba6959979b"
+  # Elegoo 2.8-inch ESP32-32E / E32R28T: ILI9341 and CYD-compatible LCD pins.
+  # Controller and pinout checked against Elegoo/LCDwiki documentation.
+  display_model: "ILI9341"
 
 esphome:
   name: pressure-gauge-bridge
   friendly_name: Pressure Gauge Bridge
+  min_version: 2026.11.0
 
 esp32:
   board: esp32dev
   framework:
-    type: esp-idf   # recommended for BLE client use
+    type: esp-idf
 
 logger:
+  level: INFO
 api:
+  # Keep the local gauge running even when Home Assistant is offline.
+  reboot_timeout: 0s
+
 ota:
   - platform: esphome
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  reboot_timeout: 0s
 
 globals:
   - id: unit_code
     type: int
-    initial_value: "1"   # psi
+    initial_value: "-1"  # Unknown until read on each connection.
   - id: decimals
     type: int
-    initial_value: "2"
+    initial_value: "-1"
+  - id: gauge_connected
+    type: bool
+    initial_value: "false"
+
+# One gauge connection; save RAM for LVGL.
+esp32_ble:
+  max_connections: 1
 
 esp32_ble_tracker:
+  scan_parameters:
+    active: false
 
 ble_client:
   - mac_address: ${gauge_mac}
     id: dpg
+    on_connect:
+      - lambda: |-
+          id(gauge_connected) = true;
+          id(unit_code) = -1;
+          id(decimals) = -1;
+          id(dpg_unit).publish_state(NAN);
+      # Notify characteristics are not automatically read on connection.
+      # Allow notification registration to finish, then read unit/precision.
+      - delay: 1s
+      - if:
+          condition:
+            lambda: return id(gauge_connected);
+          then:
+            - component.update: dpg_unit
+    on_disconnect:
+      - lambda: |-
+          id(gauge_connected) = false;
+          id(unit_code) = -1;
+          id(decimals) = -1;
+          id(dpg_unit).publish_state(NAN);
+
+binary_sensor:
+  - platform: template
+    name: "Gauge connected"
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return id(gauge_connected);
+
+# Poll unit metadata only while connected; avoid warnings while the gauge is off.
+interval:
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: return id(gauge_connected);
+          then:
+            - component.update: dpg_unit
 
 sensor:
-  # Unit/decimals: kept in globals so the pressure sensor can scale correctly.
   - platform: ble_client
     type: characteristic
     ble_client_id: dpg
@@ -57,14 +107,34 @@ sensor:
     service_uuid: ${svc}
     characteristic_uuid: "df47152b-9da9-47cb-abf2-44ba6959979b"
     notify: true
+    # Also read periodically: some gauges only notify when the unit changes.
+    update_interval: never
     accuracy_decimals: 0
     lambda: |-
-      if (x.size() < 3) return NAN;
+      if (x.size() < 3 || x[2] > 9) {
+        ESP_LOGW("dpg", "Invalid unit/precision packet");
+        return NAN;
+      }
+      const bool changed = id(unit_code) != x[1] || id(decimals) != x[2];
       id(unit_code) = x[1];
       id(decimals) = x[2];
+      if (changed) {
+        // Do not reinterpret the previous reading using new units.
+        id(dpg_pressure).publish_state(NAN);
+        ESP_LOGI("dpg", "Gauge unit code %d, decimals %d", id(unit_code), id(decimals));
+      }
       return (float) x[1];
+    on_value:
+      - if:
+          condition:
+            lambda: return !std::isfinite(x);
+          then:
+            - lambda: |-
+                id(unit_code) = -1;
+                id(decimals) = -1;
+                id(dpg_pressure).publish_state(NAN);
 
-  # Pressure, always reported to HA in psi regardless of the gauge's display unit.
+  # Always report psi to HA and the screen, regardless of the gauge's unit.
   - platform: ble_client
     type: characteristic
     ble_client_id: dpg
@@ -73,19 +143,118 @@ sensor:
     service_uuid: ${svc}
     characteristic_uuid: "df471524-9da9-47cb-abf2-44ba6959979b"
     notify: true
+    # Stream notifications without injecting periodic GATT pressure reads.
+    update_interval: never
     device_class: pressure
     state_class: measurement
     unit_of_measurement: "psi"
     accuracy_decimals: 2
+    # The observed maximum reporting interval is 10s. Clear stopped streams.
+    filters:
+      - timeout: 30s
     lambda: |-
-      if (x.size() < 6) return NAN;
+      if (x.size() < 6 || id(decimals) < 0 || id(decimals) > 9) return NAN;
       int32_t raw = (int32_t) ((uint32_t) x[2] | ((uint32_t) x[3] << 8) |
                                ((uint32_t) x[4] << 16) | ((uint32_t) x[5] << 24));
       float v = raw / powf(10.0f, id(decimals));
       switch (id(unit_code)) {
-        case 1: return v;               // psi
-        case 6: return v * 0.0145038f;  // mbar -> psi
+        case 1: return v;
+        case 6: return v * 0.0145038f;
         default:
-          ESP_LOGW("dpg", "Unknown unit code %d (raw %d); set gauge to psi", id(unit_code), raw);
+          ESP_LOGW("dpg", "Unknown unit code %d; set gauge to psi or mbar", id(unit_code));
           return NAN;
       }
+    on_value:
+      - if:
+          condition:
+            lambda: return std::isfinite(x);
+          then:
+            - lvgl.label.update:
+                id: pressure_value
+                text:
+                  format: "%.2f"
+                  args: [x]
+            - lvgl.label.update:
+                id: gauge_status
+                text: "Live"
+                text_color: 0x64D8A0
+          else:
+            - lvgl.label.update:
+                id: pressure_value
+                text: "--.--"
+            - lvgl.label.update:
+                id: gauge_status
+                text: !lambda |-
+                  if (!id(gauge_connected)) return "Gauge disconnected";
+                  if (id(decimals) < 0) return "Waiting for unit data";
+                  if (id(unit_code) != 1 && id(unit_code) != 6) return "Unsupported gauge unit";
+                  return "Waiting for pressure data";
+                text_color: 0xFFCA70
+
+# Write-only SPI avoids GPIO12, a boot strapping pin on the original CYD.
+# No touchscreen is needed to view this interface.
+spi:
+  - id: tft_spi
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+
+output:
+  - platform: ledc
+    pin: GPIO21
+    id: backlight_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    name: "Display backlight"
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+display:
+  - platform: mipi_spi
+    id: tft_display
+    model: ${display_model}
+    spi_id: tft_spi
+    cs_pin:
+      number: GPIO15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+    auto_clear_enabled: false
+    update_interval: never
+
+lvgl:
+  rotation: 90
+  displays:
+    - tft_display
+  # ~18 KiB instead of a 150 KiB full-screen buffer; leave RAM for BLE/Wi-Fi.
+  buffer_size: 12%
+  default_font: montserrat_16
+  bg_color: 0x101820
+  text_color: 0xF1F5F9
+  widgets:
+    - label:
+        text: "PRESSURE"
+        align: TOP_MID
+        y: 22
+        text_color: 0x94A3B8
+    - label:
+        id: pressure_value
+        text: "--.--"
+        text_font: montserrat_48
+        align: CENTER
+        y: -14
+    - label:
+        text: "psi"
+        text_font: montserrat_24
+        text_color: 0x94A3B8
+        align: CENTER
+        y: 35
+    - label:
+        id: gauge_status
+        text: "Connecting to gauge..."
+        text_color: 0xFFCA70
+        align: BOTTOM_MID
+        y: -22

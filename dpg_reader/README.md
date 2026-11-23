@@ -1,0 +1,67 @@
+# DPG pressure gauge bridge and display
+
+`dpg-pressure.yaml` connects directly to the Bluetooth LE pressure gauge, subscribes to its measurement notifications, publishes pressure to Home Assistant through ESPHome's native API, and displays the same value locally with LVGL. The screen works without Home Assistant or Wi-Fi once the firmware is installed.
+
+## Hardware
+
+Configured for the Elegoo 2.8-inch 240x320 ESP32-WROOM-32E resistive-touch display (documented as E32R28T): ILI9341 LCD, 4 MB flash, and no PSRAM assumed. Elegoo documents ILI9341 even though this board has USB-C. The XPT2046 is the touch controller; touch is not required or configured for this interface.
+
+| Function | ESP32 pin |
+| --- | --- |
+| LCD clock | GPIO14 |
+| LCD MOSI | GPIO13 |
+| LCD chip select | GPIO15 |
+| LCD data/command | GPIO2 |
+| Backlight PWM | GPIO21 |
+
+LCD reset is wired to the ESP32 reset signal, so no reset GPIO is configured. LCD MISO/GPIO12 is unnecessary for this write-only interface and is omitted. GPIO2 and GPIO15 are onboard boot strapping pins; their warnings are suppressed only for the documented onboard connections.
+
+The UI is a landscape pressure readout in psi, with a stream/connection status underneath. A 12% LVGL buffer uses about 18 KiB, and Bluetooth is limited to one connection to conserve RAM. The backlight is adjustable from Home Assistant. No external fonts, assets, or custom ESPHome components are needed.
+
+If the screen is blank or colors are wrong, first check the actual board against the linked manufacturer documentation. Other boards sold as a "cheap yellow display" can have ST7789 or ILI9342 controllers. USB connector type alone does not identify the LCD. Change `display_model` only after identifying a different controller; the configured pins must also match. Adjust `lvgl.rotation` between 90 and 270 to reverse the landscape orientation.
+
+## Install
+
+Use ESPHome **2026.11.0 or newer**. Configuration validation and a full ESP32 firmware build passed with 2026.11.0 using dummy Wi-Fi secrets. The firmware uses 77.9% of its OTA application partition. Seventeen synthetic-packet assertions passed against the actual C++ parsing lambdas, including signed readings, mbar conversion, invalid metadata, and unit changes. Hardware operation has not yet been tested.
+
+1. Copy `dpg-pressure.yaml` into your ESPHome configuration directory (or create a device there and replace its YAML). If the file is in a subdirectory, place `secrets.yaml` alongside it or in an ancestor ESPHome configuration directory.
+2. Supply `wifi_ssid` and `wifi_password` in `secrets.yaml`. A `secrets.yaml.example` is included; use a 2.4 GHz Wi-Fi network. Verify `gauge_mac` matches your gauge.
+3. Set the gauge to **psi** initially. Close SECA/nRF Connect and disconnect other BLE clients so the ESP32 can connect. Keep the gauge awake and nearby.
+4. Validate and install through ESPHome Device Builder, using USB for the first installation. Subsequent installations can use OTA. If using the CLI, run the following from this directory with ESPHome installed:
+
+   ```sh
+   esphome config dpg-pressure.yaml
+   esphome compile dpg-pressure.yaml
+   esphome run dpg-pressure.yaml
+   ```
+
+5. In Home Assistant, accept the discovered device under **Settings > Devices & services > ESPHome**, or add the ESPHome integration using the ESP32's IP address. It exposes `Pressure`, `Gauge connected`, `Gauge unit code` (diagnostic), and `Display backlight`.
+6. Confirm the screen and Home Assistant agree with several readings on the gauge, including zero. Power the gauge off: pressure should clear to `--.--` locally and become unknown in Home Assistant. Power it back on and check that the stream resumes.
+
+## Pressure protocol and behavior
+
+These UUIDs and packet offsets come from the draft's nRF Connect observations on 2026-11-22, not a published gauge protocol. They still need confirmation on the physical gauge.
+
+| Item | Interpretation |
+| --- | --- |
+| Service | `df471523-9da9-47cb-abf2-44ba6959979b` |
+| Measurement characteristic | `df471524-9da9-47cb-abf2-44ba6959979b`; signed little-endian int32 at bytes 2-5 |
+| Unit characteristic | `df47152b-9da9-47cb-abf2-44ba6959979b`; byte 1 is unit code, byte 2 is decimal places |
+| Scaling | `reading = raw / 10^decimal_places` |
+| Supported unit codes | 1 = psi; 6 = mbar (multiply by 0.0145038 to report psi) |
+
+No pressure is accepted until unit/precision metadata has been received on the current connection. The metadata is read shortly after connection and every 5 seconds as well as subscribed to notifications, so startup does not depend on the gauge announcing an unchanged unit. Unsupported units, short packets, and decimal counts above 9 produce unknown pressure. On metadata changes, the old reading is cleared until a new pressure notification arrives.
+
+The measurement characteristic is notification-only in this configuration: there is no periodic pressure polling and no write to the measurement-rate characteristic. Its observed reporting interval ranges from 100 ms to 10 seconds. Pressure becomes unknown on disconnect or after 30 seconds without a measurement. Unit polling does not refresh the pressure timeout.
+
+Keep the gauge unit fixed while collecting data. Unit metadata and measurements arrive on separate characteristics without a known shared sequence number; changing units during a stream could briefly pair a reading with the previous scale. To change units reliably, disconnect/power off the bridge, change the gauge unit, then reconnect it. psi and mbar are supported; other codes have not been decoded.
+
+The extra measurement fields at bytes 10-13 and 16-19 remain unused because their meaning is uncertain. A successful firmware build cannot verify the reverse-engineered protocol, notification behavior, physical display orientation, or free heap during live BLE/Wi-Fi operation. If the gauge connects but never streams, inspect its GATT properties and compare with nRF Connect before adding any guessed initialization writes. Temporarily set `logger.level: DEBUG` for BLE diagnostics.
+
+## References
+
+- [Elegoo 2.8-inch display introduction](https://wiki.elegoo.com/en/oshw-parts-%26-accessories/esp32-dispaly-introduction)
+- [LCDwiki E32R28T controller and pin assignments](https://www.lcdwiki.com/2.8inch_ESP32-32E_Display)
+- [ESPHome BLE client sensor and raw-data parsing](https://esphome.io/components/sensor/ble_client/)
+- [ESPHome LVGL and display-buffer sizing](https://esphome.io/components/lvgl/)
+- [ESPHome MIPI SPI display driver](https://esphome.io/components/display/mipi_spi/)
