@@ -22,7 +22,7 @@ If the screen is blank or colors are wrong, first check the actual board against
 
 ## Install
 
-Use ESPHome **2026.11.0 or newer**. Configuration validation and a full ESP32 firmware build passed with 2026.11.0 using dummy Wi-Fi secrets. The firmware uses 77.9% of its OTA application partition. Seventeen synthetic-packet assertions passed against the actual C++ parsing lambdas, including signed readings, mbar conversion, invalid metadata, and unit changes. Hardware operation has not yet been tested.
+Use ESPHome **2026.11.0 or newer**. Configuration validation and a full ESP32 firmware build passed with 2026.11.0 using dummy Wi-Fi secrets. The firmware fits in its OTA application partition. Seventeen synthetic-packet assertions passed against the actual C++ parsing lambdas, including signed readings, mbar conversion, invalid metadata, and unit changes. The user has confirmed basic pressure streaming and display operation; the new reporting-interval control still needs an on-device check.
 
 1. Copy `dpg-pressure.yaml` into your ESPHome configuration directory (or create a device there and replace its YAML). If the file is in a subdirectory, place `secrets.yaml` alongside it or in an ancestor ESPHome configuration directory.
 2. Supply `wifi_ssid` and `wifi_password` in `secrets.yaml`. A `secrets.yaml.example` is included; use a 2.4 GHz Wi-Fi network. Verify `gauge_mac` matches your gauge.
@@ -35,12 +35,22 @@ Use ESPHome **2026.11.0 or newer**. Configuration validation and a full ESP32 fi
    esphome run dpg-pressure.yaml
    ```
 
-5. In Home Assistant, accept the discovered device under **Settings > Devices & services > ESPHome**, or add the ESPHome integration using the ESP32's IP address. It exposes `Pressure`, `Gauge connected`, `Gauge unit code` (diagnostic), and `Display backlight`.
+5. In Home Assistant, accept the discovered device under **Settings > Devices & services > ESPHome**, or add the ESPHome integration using the ESP32's IP address. It exposes `Pressure`, `Gauge connected`, `Gauge unit code` (diagnostic), `Display backlight`, and `Pressure reporting interval` (configuration).
 6. Confirm the screen and Home Assistant agree with several readings on the gauge, including zero. Power the gauge off: pressure should clear to `--.--` locally and become unknown in Home Assistant. Power it back on and check that the stream resumes.
+
+## Home Assistant reporting interval
+
+After installing the updated firmware, open this ESPHome device in Home Assistant and find **Pressure reporting interval** under its configuration controls. Set a value from **0.1 to 60 seconds** in 0.1-second steps. The default is **1 second**; the ESP32 saves the selected value across reboots.
+
+This sets the minimum spacing between valid pressure readings forwarded to Home Assistant. For example, select 10 seconds to forward a fresh reading at most once every 10 seconds. It forwards the next arriving reading when the interval has elapsed, without averaging or inventing additional readings; if the gauge sends more slowly, Home Assistant also updates more slowly. A changed interval takes effect on subsequent readings.
+
+The LVGL display continues to receive every gauge update. Disconnects, invalid data, and the existing 30-second stale-stream timeout clear Home Assistant's pressure immediately, even with a long reporting interval. The first valid reading after startup or recovery is also forwarded immediately. The public sensor is still named `Pressure` to retain its Home Assistant identity. The updated configuration passed ESPHome 2026.11.0 validation and full compilation, plus 18 synthetic timing assertions against the actual reporting filter (including runtime interval changes, failure/recovery, and timer rollover).
+
+This control changes ESP32-to-Home-Assistant reporting only. It does not change the gauge's own measurement/BLE notification rate or write to `df471525`; the draft records that characteristic's read layout, but its write format has not been verified.
 
 ## Pressure protocol and behavior
 
-These UUIDs and packet offsets come from the draft's nRF Connect observations on 2026-11-22, not a published gauge protocol. They still need confirmation on the physical gauge.
+These UUIDs and packet offsets come from the draft's nRF Connect observations on 2026-11-22, not a published gauge protocol. Basic streaming has been confirmed on the physical gauge; unknown protocol fields and configuration writes remain unverified.
 
 | Item | Interpretation |
 | --- | --- |
@@ -65,3 +75,6 @@ The extra measurement fields at bytes 10-13 and 16-19 remain unused because thei
 - [ESPHome BLE client sensor and raw-data parsing](https://esphome.io/components/sensor/ble_client/)
 - [ESPHome LVGL and display-buffer sizing](https://esphome.io/components/lvgl/)
 - [ESPHome MIPI SPI display driver](https://esphome.io/components/display/mipi_spi/)
+
+- [ESPHome template number controls](https://esphome.io/components/number/template/)
+- [ESPHome copy sensor](https://esphome.io/components/copy/)

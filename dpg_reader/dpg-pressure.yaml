@@ -1,5 +1,5 @@
 # ESPHome: DPG Bluetooth pressure gauge (SECA app) -> Home Assistant + CYD.
-# Protocol decoded from nRF Connect reads on 2026-11-22; hardware validation needed.
+# Protocol decoded from nRF Connect reads on 2026-11-22; basic operation confirmed.
 # All multibyte fields below are little-endian:
 #   df471524: int32 at bytes 2-5 = current pressure, scaled by decimal places.
 #             Bytes 10-13 and 16-19 have unknown semantics; intentionally unused.
@@ -87,6 +87,23 @@ binary_sensor:
     entity_category: diagnostic
     lambda: return id(gauge_connected);
 
+# Minimum spacing between valid pressure reports to Home Assistant, in seconds.
+# The local display still receives every gauge notification.
+number:
+  - platform: template
+    id: pressure_report_interval
+    name: "Pressure reporting interval"
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0.1
+    max_value: 60
+    step: 0.1
+    initial_value: 1
+    optimistic: true
+    restore_value: true
+
 # Poll unit metadata only while connected; avoid warnings while the gauge is off.
 interval:
   - interval: 5s
@@ -139,7 +156,8 @@ sensor:
     type: characteristic
     ble_client_id: dpg
     id: dpg_pressure
-    name: "Pressure"
+    name: "Pressure stream"
+    internal: true
     service_uuid: ${svc}
     characteristic_uuid: "df471524-9da9-47cb-abf2-44ba6959979b"
     notify: true
@@ -190,6 +208,32 @@ sensor:
                   if (id(unit_code) != 1 && id(unit_code) != 6) return "Unsupported gauge unit";
                   return "Waiting for pressure data";
                 text_color: 0xFFCA70
+
+  # Keep the public entity named Pressure so HA retains its existing identity.
+  - platform: copy
+    source_id: dpg_pressure
+    id: dpg_pressure_ha
+    name: "Pressure"
+    filters:
+      - lambda: |-
+          static uint32_t last_report_ms = 0;
+          static bool previous_invalid = true;
+          // Never delay disconnects, invalid metadata, or the 30s stream timeout.
+          if (!std::isfinite(x)) {
+            previous_invalid = true;
+            return x;
+          }
+          const uint32_t now = millis();
+          const uint32_t interval_ms = static_cast<uint32_t>(
+              lroundf(id(pressure_report_interval).state * 1000.0f));
+          // Also send the first valid reading after startup/recovery immediately.
+          // Unsigned subtraction keeps this working across millis() rollover.
+          if (previous_invalid || now - last_report_ms >= interval_ms) {
+            previous_invalid = false;
+            last_report_ms = now;
+            return x;
+          }
+          return {};
 
 # Write-only SPI avoids GPIO12, a boot strapping pin on the original CYD.
 # No touchscreen is needed to view this interface.
