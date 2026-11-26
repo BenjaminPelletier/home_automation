@@ -1,0 +1,126 @@
+esphome:
+  name: flow-director
+  friendly_name: Flow Director
+  min_version: 2026.11.0
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          ++id(boot_count);
+          id(number_of_boots).publish_state(id(boot_count));
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret flow_director_api_encryption_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+
+preferences:
+  # Persist the counter promptly after startup.
+  flash_write_interval: 1s
+
+globals:
+  - id: boot_count
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+    update_interval: 100ms
+
+# The board's relay outputs are active-high. Off selects the pool for each valve.
+switch:
+  - platform: gpio
+    id: intake_valve_relay
+    pin: GPIO27
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: return_valve_relay
+    pin: GPIO26
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: Booster pump
+    pin: GPIO13
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: Aux 2
+    # GPIO12 is a boot strapping pin wired to relay 7 on this board.
+    pin: GPIO12
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: Aux 3
+    pin: GPIO14
+    restore_mode: ALWAYS_OFF
+
+select:
+  - platform: template
+    name: Pool mode
+    options:
+      - Pool
+      - Spa fill
+      - Spa
+      - Spa drain
+    initial_option: Pool
+    optimistic: true
+    set_action:
+      - switch.control:
+          id: intake_valve_relay
+          state: !lambda 'return x == "Spa" || x == "Spa drain";'
+      - switch.control:
+          id: return_valve_relay
+          state: !lambda 'return x == "Spa" || x == "Spa fill";'
+
+sensor:
+  - platform: template
+    name: Pressure
+    device_class: pressure
+    state_class: measurement
+    unit_of_measurement: psi
+    accuracy_decimals: 1
+    force_update: true
+    update_interval: 15s
+    # Placeholder until the DPG gauge from ../dpg_reader is integrated.
+    lambda: return 0.0f;
+
+  - platform: uptime
+    name: Minutes since boot
+    type: seconds
+    device_class: duration
+    unit_of_measurement: min
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    filters:
+      - lambda: return x / 60.0f;
+
+  - platform: template
+    id: number_of_boots
+    name: Number of boots
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP address
+      entity_category: diagnostic
