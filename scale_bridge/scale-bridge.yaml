@@ -1,0 +1,81 @@
+substitutions:
+  scale_mac: "A0:77:9E:B8:2C:7D"
+  scale_log_level: "INFO"
+
+esphome:
+  name: tko-scale-bridge
+  friendly_name: TKO Scale Bridge
+  min_version: 2026.11.0
+
+# Same Elegoo ESP32-32E / E32R28T board as dpg_reader.
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  initial_level: INFO
+  logs:
+    tko_scale: ${scale_log_level}
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+  on_ble_advertise:
+    - mac_address: ${scale_mac}
+      then:
+        - lambda: |-
+            for (const auto &frame : x.get_manufacturer_datas()) {
+              // ESPHome exposes the two company ID bytes separately from the payload.
+              const uint16_t company_id = frame.uuid.uuid16();
+              const auto &payload = frame.data;
+              ESP_LOGD("tko_scale", "ID 0x%04X, RSSI %d dBm, payload %s", company_id,
+                       x.get_rssi(), format_hex_pretty(payload, ' ', false).c_str());
+
+              // OKOK/Chipsea C0 broadcasts echo the advertiser's MAC at bytes 7–12.
+              // The high byte of the company ID varies between advertisements.
+              if ((company_id & 0xFF) != 0xC0 || payload.size() != 13 ||
+                  !std::equal(payload.begin() + 7, payload.end(), x.address())) {
+                continue;
+              }
+
+              // Accept the documented stable kg properties for this protocol.
+              // The corresponding 0x20 and 0x24 frames are idle or settling.
+              const uint8_t properties = payload[6];
+              if (properties != 0x21 && properties != 0x25) {
+                continue;
+              }
+
+              const uint16_t raw_weight = (uint16_t{payload[0]} << 8) | payload[1];
+              const float weight_kg = raw_weight / (properties == 0x25 ? 100.0f : 10.0f);
+              if (weight_kg <= 0.0f || weight_kg > 300.0f) {
+                continue;
+              }
+
+              if (!id(scale_weight).has_state() || id(scale_weight).get_state() != weight_kg) {
+                ESP_LOGI("tko_scale", "Stable weight %.2f kg (properties 0x%02X)", weight_kg, properties);
+                id(scale_weight).publish_state(weight_kg);
+              }
+            }
+
+sensor:
+  - platform: template
+    id: scale_weight
+    name: Weight
+    device_class: weight
+    state_class: measurement
+    unit_of_measurement: kg
+    accuracy_decimals: 2
+    update_interval: never
