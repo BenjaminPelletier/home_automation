@@ -1,7 +1,14 @@
+substitutions:
+  # Same gauge and service as ../dpg_reader/dpg-pressure.yaml.
+  gauge_mac: "D3:31:E8:2F:CC:51"
+  gauge_service_uuid: "df471523-9da9-47cb-abf2-44ba6959979b"
+
 esphome:
   name: flow-director
   friendly_name: Flow Director
   min_version: 2026.11.0
+  includes:
+    - ../dpg_reader/pressure_statistics.h
   on_boot:
     priority: -100
     then:
@@ -41,6 +48,62 @@ globals:
     initial_value: "0"
     update_interval: 100ms
 
+  - id: dpg_unit_code
+    type: int
+    initial_value: "-1"
+
+  - id: dpg_decimals
+    type: int
+    initial_value: "-1"
+
+esp32_ble:
+  max_connections: 1
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+
+ble_client:
+  - id: dpg
+    mac_address: ${gauge_mac}
+    on_connect:
+      # Allow the characteristic subscriptions to finish before reading the unit.
+      - delay: 1s
+      - if:
+          condition:
+            lambda: return id(dpg).connected();
+          then:
+            - component.update: dpg_unit_metadata
+    on_disconnect:
+      - lambda: id(dpg_unit_metadata).publish_state(NAN);
+
+interval:
+  # Read the unit even when the gauge only notifies on a change.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: return id(dpg).connected();
+          then:
+            - component.update: dpg_unit_metadata
+
+  # Close completed windows even when the gauge stops sending readings.
+  - interval: 1s
+    then:
+      - lambda: |-
+          dpg_statistics::statistics.advance(millis(), [](const dpg_statistics::PressureSummary &result) {
+            id(minimum_pressure).publish_state(result.minimum);
+            id(maximum_pressure).publish_state(result.maximum);
+            id(average_pressure).publish_state(result.average);
+          });
+
+binary_sensor:
+  - platform: template
+    name: Gauge connected
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return id(dpg).connected();
+
 # The board's relay outputs are active-high. Off selects the pool for each valve.
 switch:
   - platform: gpio
@@ -61,6 +124,11 @@ switch:
     restore_mode: ALWAYS_OFF
 
   - platform: gpio
+    name: Pool heater
+    pin: GPIO32
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
     name: Aux 2
     # GPIO12 is a boot strapping pin wired to relay 7 on this board.
     pin: GPIO12
@@ -70,6 +138,22 @@ switch:
     name: Aux 3
     pin: GPIO14
     restore_mode: ALWAYS_OFF
+
+# Minimum spacing between valid pressure reports to Home Assistant.
+number:
+  - platform: template
+    id: pressure_report_interval
+    name: Pressure reporting interval
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: s
+    mode: box
+    min_value: 0.1
+    max_value: 60
+    step: 0.1
+    initial_value: 15
+    optimistic: true
+    restore_value: true
 
 select:
   - platform: template
@@ -89,17 +173,150 @@ select:
           id: return_valve_relay
           state: !lambda 'return x == "Spa" || x == "Spa fill";'
 
-sensor:
   - platform: template
-    name: Pressure
+    id: pressure_statistics_period
+    name: Pressure statistics period
+    icon: mdi:timer-outline
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: "1 minute"
+    options:
+      - "1 minute"
+      - "5 minutes"
+      - "10 minutes"
+      - "15 minutes"
+      - "30 minutes"
+      - "60 minutes"
+    on_value:
+      - lambda: |-
+          const uint32_t periods_ms[] = {
+            60000U, 300000U, 600000U, 900000U, 1800000U, 3600000U
+          };
+          dpg_statistics::statistics.set_period(millis(), periods_ms[i]);
+
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: dpg
+    id: dpg_unit_metadata
+    name: Gauge unit code
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    service_uuid: ${gauge_service_uuid}
+    characteristic_uuid: "df47152b-9da9-47cb-abf2-44ba6959979b"
+    notify: true
+    update_interval: never
+    lambda: |-
+      if (x.size() < 3 || x[2] > 9) return NAN;
+      if (id(dpg_unit_code) != x[1] || id(dpg_decimals) != x[2]) {
+        id(dpg_unit_code) = x[1];
+        id(dpg_decimals) = x[2];
+        // Wait for a new measurement whenever the scale changes.
+        id(dpg_pressure).publish_state(NAN);
+        if (x[1] != 1 && x[1] != 6) {
+          ESP_LOGW("dpg", "Unsupported unit code %u; set the gauge to psi or mbar",
+                   static_cast<unsigned>(x[1]));
+        }
+      }
+      return x[1];
+    on_value:
+      - lambda: |-
+          if (!std::isfinite(x)) {
+            id(dpg_unit_code) = -1;
+            id(dpg_decimals) = -1;
+            id(dpg_pressure).publish_state(NAN);
+          }
+
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: dpg
+    id: dpg_pressure
+    internal: true
     device_class: pressure
     state_class: measurement
     unit_of_measurement: psi
-    accuracy_decimals: 1
+    accuracy_decimals: 2
+    service_uuid: ${gauge_service_uuid}
+    characteristic_uuid: "df471524-9da9-47cb-abf2-44ba6959979b"
+    notify: true
+    update_interval: never
+    filters:
+      - timeout: 30s
+    lambda: |-
+      if (x.size() < 6 || id(dpg_decimals) < 0) return NAN;
+      const uint32_t bits = static_cast<uint32_t>(x[2]) |
+                            (static_cast<uint32_t>(x[3]) << 8) |
+                            (static_cast<uint32_t>(x[4]) << 16) |
+                            (static_cast<uint32_t>(x[5]) << 24);
+      const float value = static_cast<int32_t>(bits) / powf(10.0f, id(dpg_decimals));
+      switch (id(dpg_unit_code)) {
+        case 1: return value;
+        case 6: return value * 0.0145038f;
+        default: return NAN;
+      }
+    on_value:
+      - lambda: |-
+          dpg_statistics::statistics.sample(millis(), x, [](const dpg_statistics::PressureSummary &result) {
+            id(minimum_pressure).publish_state(result.minimum);
+            id(maximum_pressure).publish_state(result.maximum);
+            id(average_pressure).publish_state(result.average);
+          });
+
+  # Keep the existing Home Assistant entity and report the next fresh sample.
+  - platform: copy
+    source_id: dpg_pressure
+    id: pressure
+    name: Pressure
     force_update: true
-    update_interval: 15s
-    # Placeholder until the DPG gauge from ../dpg_reader is integrated.
-    lambda: return 0.0f;
+    filters:
+      - lambda: |-
+          static uint32_t last_report_ms = 0;
+          static bool previous_invalid = true;
+          if (!std::isfinite(x)) {
+            previous_invalid = true;
+            return x;
+          }
+          const uint32_t now = millis();
+          const uint32_t interval_ms = static_cast<uint32_t>(
+              lroundf(id(pressure_report_interval).state * 1000.0f));
+          // Unsigned subtraction handles millis() rollover.
+          if (previous_invalid || now - last_report_ms >= interval_ms) {
+            previous_invalid = false;
+            last_report_ms = now;
+            return x;
+          }
+          return {};
+
+  - platform: template
+    id: minimum_pressure
+    name: Minimum pressure
+    device_class: pressure
+    state_class: measurement
+    unit_of_measurement: psi
+    accuracy_decimals: 2
+    force_update: true
+    update_interval: never
+
+  - platform: template
+    id: maximum_pressure
+    name: Maximum pressure
+    device_class: pressure
+    state_class: measurement
+    unit_of_measurement: psi
+    accuracy_decimals: 2
+    force_update: true
+    update_interval: never
+
+  - platform: template
+    id: average_pressure
+    name: Average pressure
+    device_class: pressure
+    state_class: measurement
+    unit_of_measurement: psi
+    accuracy_decimals: 2
+    force_update: true
+    update_interval: never
 
   - platform: uptime
     name: Minutes since boot
@@ -124,3 +341,22 @@ text_sensor:
     ip_address:
       name: IP address
       entity_category: diagnostic
+
+  - platform: template
+    id: gauge_status
+    name: Gauge status
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: |-
+      const char *status = "Waiting for pressure data";
+      if (!id(dpg).connected()) {
+        status = "Gauge disconnected";
+      } else if (id(dpg_decimals) < 0) {
+        status = "Waiting for unit data";
+      } else if (id(dpg_unit_code) != 1 && id(dpg_unit_code) != 6) {
+        status = "Unsupported gauge unit";
+      } else if (std::isfinite(id(dpg_pressure).state)) {
+        status = "Live";
+      }
+      if (id(gauge_status).state == status) return {};
+      return {status};
